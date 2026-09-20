@@ -204,6 +204,28 @@ def test_два_вложения_с_одним_именем_не_затираю�
     assert len(list((tmp_path / "01").iterdir())) == 2
 
 
+def test_криптоподпись_не_считается_вложением(tmp_path):
+    """Корпоративная почта цепляет smime.p7s почти к каждому письму — это не вложение."""
+    msg = make_msg("Счёт", "buh@example.ru", "Счёт во вложении.")
+    msg.add_attachment(
+        "данные счёта".encode(),
+        maintype="application",
+        subtype=XLSX.split("/")[1],
+        filename="счёт 17.xlsx",
+    )
+    msg.add_attachment(
+        "подпись".encode(),
+        maintype="application",
+        subtype="pkcs7-signature",
+        filename="smime.p7s",
+    )
+    parsed = roundtrip(msg)
+
+    saved = fetch_mail.save_attachments(parsed, tmp_path / "01")
+
+    assert [путь.name for _, путь in saved] == ["счёт 17.xlsx"]
+
+
 def test_вложение_с_именем_в_rfc2047(tmp_path):
     """Русское имя, закодированное =?utf-8?B?...?= — должно раскодироваться."""
     msg = make_msg("Договор", "zakaz@example.ru", "Договор во вложении.")

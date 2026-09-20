@@ -69,6 +69,15 @@ MAX_NAME_LEN = 120
 # Короче этого plain-часть считаем заглушкой вида «письмо содержит HTML»
 PLAIN_STUB_LEN = 30
 
+# Служебные «вложения», которые на самом деле вложениями не являются:
+# криптоподписи писем. Корпоративная почта цепляет их почти к каждому письму.
+SKIP_TYPES = {
+    "application/pkcs7-signature",
+    "application/x-pkcs7-signature",
+    "application/pgp-signature",
+}
+SKIP_NAMES = {"smime.p7s", "signature.asc"}
+
 
 # --- настройки ------------------------------------------------------------
 
@@ -245,6 +254,8 @@ def save_attachments(msg, directory: Path) -> list:
         raw_name = part.get_filename()
         if not raw_name:
             continue
+        if part.get_content_type().lower() in SKIP_TYPES or raw_name.lower() in SKIP_NAMES:
+            continue  # подпись письма, а не вложение
         payload = part.get_payload(decode=True)
         if payload is None:
             continue
