@@ -69,15 +69,23 @@ outlook.com, rambler.ru и родственные домены).
 
 ### 4. Проверка
 
+Запускать всё через `run.cmd` — он сам находит настоящий Python:
+
 ```
-python -m pytest tests -q
+run.cmd -m pytest tests -q
 ```
 
 Должно быть `39 passed`. Потом:
 
 ```
-python fetch_mail.py --days 3
+run.cmd fetch_mail.py --days 3
 ```
+
+**Почему не просто `python`.** В Windows команда `python` часто ведёт на
+заглушку из Microsoft Store: она печатает слово «Python» и молча ничего не
+делает, даже если настоящий Python установлен. `run.cmd` ищет интерпретатор
+напрямую и обходит эту ловушку. Если он пишет `Python not found` — Python
+действительно не установлен.
 
 Должно напечатать, сколько писем выгружено. Файл появится в `Почта/выгрузки/`.
 
