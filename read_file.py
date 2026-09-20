@@ -110,6 +110,11 @@ def _cell_value(c, shared: list) -> str:
         return "".join(t.text or "" for t in c.iter(f"{S}t")).strip()
     v = c.find(f"{S}v")
     if v is None or v.text is None:
+        # Файл, собранный программой, а не Excel: формула есть, а её значение
+        # ещё не посчитано. Лучше показать саму формулу, чем пустую ячейку.
+        f = c.find(f"{S}f")
+        if f is not None and f.text:
+            return f"={f.text}"
         return ""
     if тип == "s":
         try:
