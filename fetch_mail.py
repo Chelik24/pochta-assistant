@@ -303,15 +303,69 @@ def imap_date(dt: datetime) -> str:
     return f"{dt.day:02d}-{MONTHS[dt.month - 1]}-{dt.year}"
 
 
-def fetch_account(account: dict, args, base: Path, attach_root: Path, rules: list) -> dict:
+def parse_date(текст: str) -> datetime:
+    """Дата из командной строки: 05.09.2026 или 2026-09-05."""
+    for формат in ("%d.%m.%Y", "%Y-%m-%d", "%d.%m.%y"):
+        try:
+            return datetime.strptime(текст, формат)
+        except ValueError:
+            continue
+    sys.exit(f"Не понял дату «{текст}». Пишите так: 05.09.2026")
+
+
+def build_criteria(args, since: datetime, before) -> tuple:
+    """
+    Условия поиска для IMAP.
+
+    Возвращает (условия, литерал, доп_фильтры):
+      условия     — список аргументов SEARCH;
+      литерал     — русский текст, который уйдёт отдельным блоком (или None);
+      доп_фильтры — что не влезло в запрос и фильтруется уже у нас.
+
+    IMAP умеет принять только один текстовый блок с не-латиницей за запрос,
+    и он обязан идти последним аргументом. Остальное досеиваем сами.
+    """
+    условия = []
+    if args.unseen:
+        условия.append("UNSEEN")
+    условия += ["SINCE", imap_date(since)]
+    if before:
+        условия += ["BEFORE", imap_date(before)]
+
+    литерал = None
+    доп_фильтры = []
+    for ключ, значение in (("FROM", args.from_addr),
+                           ("SUBJECT", args.subject),
+                           ("TEXT", args.search)):
+        if not значение:
+            continue
+        if значение.isascii():
+            условия += [ключ, f'"{значение}"']
+        elif литерал is None:
+            литерал = (ключ, значение)
+        else:
+            доп_фильтры.append((ключ, значение.lower()))
+
+    if литерал:
+        условия.append(литерал[0])  # литерал подставится следом
+    return условия, литерал, доп_фильтры
+
+
+def подходит_под_доп_фильтры(msg, доп_фильтры) -> bool:
+    for ключ, значение in доп_фильтры:
+        поле = "from" if ключ == "FROM" else "subject"
+        if значение not in clean_header(msg.get(поле)).lower():
+            return False
+    return True
+
+
+def fetch_account(account: dict, args, base: Path, attach_root: Path, rules: list,
+                  since: datetime, before) -> dict:
     """Выгружает один ящик. Ошибка одного ящика не должна ронять остальные."""
     итог = {"user": account["user"], "lines": [], "писем": 0, "мусора": 0,
             "вложений": 0, "мусор_темы": [], "ошибка": None}
 
-    since = datetime.now() - timedelta(days=args.days)
-    criteria = ["SINCE", imap_date(since)]
-    if args.unseen:
-        criteria.append("UNSEEN")
+    criteria, литерал, доп_фильтры = build_criteria(args, since, before)
 
     try:
         imap = imaplib.IMAP4_SSL(account["host"], IMAP_PORT)
@@ -334,12 +388,24 @@ def fetch_account(account: dict, args, base: Path, attach_root: Path, rules: lis
             итог["ошибка"] = f"не удалось открыть папку {args.folder}"
             return итог
 
-        status, data = imap.search(None, *criteria)
-        ids = data[0].split() if status == "OK" and data and data[0] else []
+        if литерал:
+            # Русский текст уходит отдельным блоком: иначе imaplib не смог бы
+            # его закодировать, а сервер — распознать.
+            imap.literal = литерал[1].encode("utf-8")
+            status, data = imap.search("UTF-8", *criteria)
+        else:
+            status, data = imap.search(None, *criteria)
+        if status != "OK":
+            итог["ошибка"] = "сервер не принял условия поиска"
+            return итог
+        ids = data[0].split() if data and data[0] else []
+
+        # В кратком режиме тело не скачиваем — только заголовки
+        часть = "(BODY.PEEK[HEADER])" if args.brief else "(BODY.PEEK[])"
 
         номер = 0
         for msg_id in reversed(ids):  # сначала новые
-            status, msg_data = imap.fetch(msg_id, "(BODY.PEEK[])")  # PEEK — не помечать прочитанным
+            status, msg_data = imap.fetch(msg_id, часть)  # PEEK — не помечать прочитанным
             if status != "OK":
                 continue
             raw = next((part[1] for part in msg_data if isinstance(part, tuple)), None)
@@ -350,12 +416,20 @@ def fetch_account(account: dict, args, base: Path, attach_root: Path, rules: lis
             тема = clean_header(msg.get("subject")) or "(без темы)"
             отправитель = clean_header(msg.get("from"))
 
+            if not подходит_под_доп_фильтры(msg, доп_фильтры):
+                continue
+
             if not args.all and is_junk(отправитель, тема, rules):
                 итог["мусора"] += 1
                 итог["мусор_темы"].append(f"{отправитель} — {тема}")
                 continue
 
             номер += 1
+            if args.brief:
+                дата = clean_header(msg.get("date"))
+                итог["lines"].append(f"{номер}. {дата} — {отправитель} — {тема}")
+                continue
+
             text = get_text(msg)
             if len(text) > args.max_chars:
                 text = text[: args.max_chars] + "\n…[текст обрезан]"
@@ -394,6 +468,13 @@ def fetch_account(account: dict, args, base: Path, attach_root: Path, rules: lis
 def main():
     parser = argparse.ArgumentParser(description="Выгрузка писем для разбора ИИ")
     parser.add_argument("--days", type=int, default=1, help="за сколько дней (по умолчанию 1)")
+    parser.add_argument("--since", help="с какой даты: 05.09.2026 (вместо --days)")
+    parser.add_argument("--before", help="по какую дату включительно: 10.09.2026")
+    parser.add_argument("--search", help="слово в тексте письма")
+    parser.add_argument("--from-addr", dest="from_addr", help="адрес или домен отправителя")
+    parser.add_argument("--subject", help="слово в теме")
+    parser.add_argument("--brief", action="store_true",
+                        help="только заголовки: от кого, когда, тема (для больших периодов)")
     parser.add_argument("--unseen", action="store_true", help="только непрочитанные")
     parser.add_argument("--folder", default="INBOX", help="папка ящика (по умолчанию INBOX)")
     parser.add_argument("--out", default="Почта/выгрузки", help="куда сохранять файл")
@@ -415,22 +496,30 @@ def main():
     rules = load_ignore_rules(base / args.ignore_file)
 
     now = datetime.now()
-    since = now - timedelta(days=args.days)
+    since = parse_date(args.since) if args.since else now - timedelta(days=args.days)
+    before = parse_date(args.before) + timedelta(days=1) if args.before else None
     attach_root = base / args.attach_dir / f"{now:%Y-%m-%d_%H-%M}"
 
-    результаты = [fetch_account(a, args, base, attach_root, rules) for a in accounts]
+    результаты = [fetch_account(a, args, base, attach_root, rules, since, before)
+                  for a in accounts]
 
     всего = sum(r["писем"] for r in результаты)
     мусора = sum(r["мусора"] for r in результаты)
     вложений = sum(r["вложений"] for r in результаты)
     ошибки = [r for r in результаты if r["ошибка"]]
 
+    период = f"с {since:%d.%m.%Y}" + (f" по {args.before}" if args.before else "")
+    условия = [f"«{з}» в {п}" for п, з in
+               (("отправителе", args.from_addr), ("теме", args.subject), ("тексте", args.search)) if з]
+
     lines = [
         f"# Почта: выгрузка {now:%d.%m.%Y %H:%M}",
         "",
-        f"Период: с {since:%d.%m.%Y}. Папка: {args.folder}. "
+        f"Период: {период}. Папка: {args.folder}. "
         f"{'Только непрочитанные. ' if args.unseen else ''}"
-        f"Ящиков: {len(accounts)}. Писем: {всего}."
+        + (f"Поиск: {', '.join(условия)}. " if условия else "")
+        + (f"Краткий режим, без текстов. " if args.brief else "")
+        + f"Ящиков: {len(accounts)}. Писем: {всего}."
         + (f" Отброшено как мусор: {мусора}." if мусора else ""),
         "",
     ]

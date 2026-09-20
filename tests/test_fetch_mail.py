@@ -6,9 +6,11 @@
 """
 
 import email
+from datetime import datetime
 from email.header import Header
 from email.message import EmailMessage
 from email.policy import default
+from types import SimpleNamespace
 
 import pytest
 
@@ -592,3 +594,91 @@ def test_упавший_ящик_не_ломает_остальные(tmp_path, 
     assert "⚠️ **work@gmail.com**" in текст
     assert "ПАРОЛЬ ДЛЯ ВНЕШНЕГО ПРИЛОЖЕНИЯ" in текст
     assert "## Ящик: work@mail.ru — писем: 3" in текст  # рабочий ящик выгрузился
+
+
+# --- поиск и периоды ------------------------------------------------------
+
+
+@pytest.mark.parametrize("строка, ожидание", [
+    ("05.09.2026", datetime(2026, 9, 5)),
+    ("2026-09-05", datetime(2026, 9, 5)),
+    ("05.09.26", datetime(2026, 9, 5)),
+])
+def test_дата_разбирается(строка, ожидание):
+    assert fetch_mail.parse_date(строка) == ожидание
+
+
+def test_кривая_дата_объясняет_формат():
+    with pytest.raises(SystemExit) as e:
+        fetch_mail.parse_date("вчера")
+    assert "05.09.2026" in str(e.value)
+
+
+def _аргументы(**kw):
+    поля = dict(unseen=False, from_addr=None, subject=None, search=None, brief=False)
+    поля.update(kw)
+    return SimpleNamespace(**поля)
+
+
+СЕНТЯБРЬ = datetime(2026, 9, 1)
+
+
+def test_латинские_условия_уходят_прямо_в_запрос():
+    условия, литерал, доп = fetch_mail.build_criteria(
+        _аргументы(from_addr="@partner.ru"), СЕНТЯБРЬ, None)
+
+    assert условия == ["SINCE", "01-Sep-2026", "FROM", '"@partner.ru"']
+    assert литерал is None
+    assert доп == []
+
+
+def test_русское_слово_уходит_отдельным_блоком():
+    """IMAP не принимает кириллицу внутри команды — только отдельным литералом."""
+    условия, литерал, доп = fetch_mail.build_criteria(
+        _аргументы(search="сотрудничество"), СЕНТЯБРЬ, None)
+
+    assert условия[-1] == "TEXT"          # литерал обязан идти последним
+    assert литерал == ("TEXT", "сотрудничество")
+    assert доп == []
+
+
+def test_второе_русское_условие_фильтруется_у_нас():
+    """Литерал в запросе может быть только один, остальное досеиваем сами."""
+    условия, литерал, доп = fetch_mail.build_criteria(
+        _аргументы(subject="тендер", search="клининг"), СЕНТЯБРЬ, None)
+
+    assert литерал == ("SUBJECT", "тендер")
+    assert доп == [("TEXT", "клининг")]
+
+
+def test_диапазон_дат_в_запросе():
+    условия, _, _ = fetch_mail.build_criteria(
+        _аргументы(), СЕНТЯБРЬ, datetime(2026, 9, 10))
+
+    assert "BEFORE" in условия
+    assert условия[условия.index("BEFORE") + 1] == "10-Sep-2026"
+
+
+def test_непрочитанные_вместе_с_периодом():
+    условия, _, _ = fetch_mail.build_criteria(_аргументы(unseen=True), СЕНТЯБРЬ, None)
+    assert условия[0] == "UNSEEN"
+
+
+def test_доп_фильтр_по_теме():
+    msg = roundtrip(make_msg("Тендер на клининг", "zakaz@example.ru", "текст"))
+
+    assert fetch_mail.подходит_под_доп_фильтры(msg, [("SUBJECT", "клининг")])
+    assert not fetch_mail.подходит_под_доп_фильтры(msg, [("SUBJECT", "вентиляция")])
+
+
+def test_краткий_режим_не_качает_тела(tmp_path, monkeypatch):
+    текст = _прогнать(tmp_path, monkeypatch, {
+        "MAIL_1_USER": "work@mail.ru", "MAIL_1_PASSWORD": "п1",
+    }, доп_аргументы=["--brief"])
+
+    assert "Краткий режим" in текст
+    assert "Самое свежее письмо" in текст          # тема на месте
+    assert "Когда будет готово КП?" not in текст    # текста письма нет
+
+    for _, часть in ЗаглушкаIMAP.последний.команды_fetch:
+        assert "BODY.PEEK[HEADER]" in часть, "в кратком режиме тело качать не нужно"
