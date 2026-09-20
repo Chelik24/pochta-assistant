@@ -78,6 +78,17 @@ SKIP_TYPES = {
 }
 SKIP_NAMES = {"smime.p7s", "signature.asc"}
 
+# Значения из .env.example. Если их не заменили — это не ящик, а забытый
+# кусок шаблона: пытаться войти с ним бессмысленно, а ошибка про пароль
+# уводит в сторону.
+ПРИМЕРЫ = {
+    "name@mail.ru",
+    "name@gmail.com",
+    "name@yandex.ru",
+    "пароль_для_внешнего_приложения",
+    "шестнадцатьсимволов",
+}
+
 
 # --- настройки ------------------------------------------------------------
 
@@ -106,17 +117,25 @@ def guess_host(user: str) -> str:
     return host
 
 
+def из_примера(user: str, password: str) -> bool:
+    return user.lower() in ПРИМЕРЫ or password in ПРИМЕРЫ
+
+
 def load_accounts(env: dict) -> list:
     """Ящики из .env. Поддерживает и один ящик, и пронумерованные MAIL_1_, MAIL_2_…"""
     accounts = []
+    пропущены = []
 
     # старый формат с одним ящиком
     if env.get("MAIL_USER"):
-        accounts.append({
-            "user": env["MAIL_USER"],
-            "password": env.get("MAIL_APP_PASSWORD", ""),
-            "host": env.get("MAIL_HOST") or guess_host(env["MAIL_USER"]),
-        })
+        if из_примера(env["MAIL_USER"], env.get("MAIL_APP_PASSWORD", "")):
+            пропущены.append(env["MAIL_USER"])
+        else:
+            accounts.append({
+                "user": env["MAIL_USER"],
+                "password": env.get("MAIL_APP_PASSWORD", ""),
+                "host": env.get("MAIL_HOST") or guess_host(env["MAIL_USER"]),
+            })
 
     # пронумерованные ящики
     номера = sorted(
@@ -127,13 +146,24 @@ def load_accounts(env: dict) -> list:
         if not user:
             continue
         password = env.get(f"MAIL_{i}_PASSWORD") or env.get(f"MAIL_{i}_APP_PASSWORD") or ""
+        if из_примера(user, password):
+            пропущены.append(user)
+            continue
         accounts.append({
             "user": user,
             "password": password,
             "host": env.get(f"MAIL_{i}_HOST") or guess_host(user),
         })
 
+    for user in пропущены:
+        print(f"Пропущен ящик из шаблона: {user} — замените или удалите эти строки в .env")
+
     if not accounts:
+        if пропущены:
+            sys.exit(
+                "В .env остались только строки из примера. Впишите настоящий адрес "
+                "и пароль для внешнего приложения вместо них."
+            )
         sys.exit(
             "В .env не найдено ни одного ящика. Нужны строки вида "
             "MAIL_1_USER и MAIL_1_PASSWORD (см. .env.example)."

@@ -467,6 +467,28 @@ def test_ящик_без_пароля_ловится_сразу():
     assert "denis@mail.ru" in str(e.value)
 
 
+def test_забытые_строки_из_шаблона_пропускаются(capsys):
+    """Если .env скопировали и заполнили только второй ящик — первый не должен мешать."""
+    accounts = fetch_mail.load_accounts({
+        "MAIL_1_USER": "name@mail.ru",
+        "MAIL_1_PASSWORD": "пароль_для_внешнего_приложения",
+        "MAIL_2_USER": "denis@gmail.com",
+        "MAIL_2_PASSWORD": "настоящийпароль",
+    })
+
+    assert [a["user"] for a in accounts] == ["denis@gmail.com"]
+    assert "Пропущен ящик из шаблона: name@mail.ru" in capsys.readouterr().out
+
+
+def test_только_шаблон_в_env_даёт_понятную_ошибку():
+    with pytest.raises(SystemExit) as e:
+        fetch_mail.load_accounts({
+            "MAIL_1_USER": "name@mail.ru",
+            "MAIL_1_PASSWORD": "пароль_для_внешнего_приложения",
+        })
+    assert "из примера" in str(e.value)
+
+
 def test_пустой_env_понятно_сообщает():
     with pytest.raises(SystemExit) as e:
         fetch_mail.load_accounts({})
