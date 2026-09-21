@@ -66,6 +66,8 @@ class ЗаглушкаIMAP:
 
     последний = None
     папки = {"INBOX": ВХОДЯЩИЕ, "Sent": ОТПРАВЛЕННЫЕ}
+    # Письма старее собранного периода: их отдают только на запрос с BEFORE
+    старые = {}
     uidvalidity = {"INBOX": 111, "Sent": 222}
 
     def __init__(self, host, port):
@@ -107,6 +109,8 @@ class ЗаглушкаIMAP:
                 # Так ведёт себя настоящий сервер: диапазон «N:*» всегда
                 # отдаёт хотя бы последнее письмо, даже если новых нет.
                 найдены = найдены or [max(письма)]
+            elif "BEFORE" in args:
+                найдены = sorted(self.старые.get(self.папка, {}))
             else:
                 найдены = sorted(письма)
             return "OK", [b" ".join(str(u).encode() for u in найдены)]
@@ -115,9 +119,10 @@ class ЗаглушкаIMAP:
         if "FLAGS" in args[1] and "BODY" not in args[1]:
             return "OK", [b"%d (UID %d FLAGS (\\Seen))" % (i, u) for i, u in enumerate(uids, 1)]
 
+        все = {**self.старые.get(self.папка, {}), **письма}
         ответ = []
         for i, u in enumerate(uids, 1):
-            сырое = письма[u].as_bytes()
+            сырое = все[u].as_bytes()
             ответ.append((b"%d (UID %d BODY[] {%d}" % (i, u, len(сырое)), сырое))
             ответ.append(b")")
         return "OK", ответ
@@ -217,6 +222,61 @@ def test_докачка_подхватывает_новое(архив, monkeypa
     темы = [r["subject"] for r in строки_базы(база, "SELECT subject FROM messages")]
     assert "Срочно: замечания по объекту" in темы
     assert len(темы) == 5
+
+
+def test_углубление_архива_добирает_старое(архив, monkeypatch, capsys):
+    """«Скачать за полгода» на непустом архиве обязано сходить за старыми письмами."""
+    база, запустить, tmp = архив
+    monkeypatch.setitem(ЗаглушкаIMAP.старые, "INBOX", {
+        7: письмо("Договор на весенний период", "Заказчик <old@zakazchik.ru>",
+                  "Направляю договор.", дата="Mon, 16 Mar 2026 10:00:00 +0300"),
+    })
+
+    запустить("скачать", "--дней", "180", "--attach-dir", str(tmp / "вложения"))
+
+    темы = [r["subject"] for r in строки_базы(база, "SELECT subject FROM messages")]
+    assert "Договор на весенний период" in темы
+    assert "добираю письма старее" in capsys.readouterr().out
+
+
+def test_обычная_докачка_за_старым_не_лезет(архив, monkeypatch):
+    """Ежедневная докачка не должна каждый раз перетряхивать весь ящик."""
+    _, запустить, tmp = архив
+    ЗаглушкаIMAP.последний.команды.clear()
+
+    запустить("скачать", "--attach-dir", str(tmp / "вложения"))
+
+    поиски = [args for команда, args in ЗаглушкаIMAP.последний.команды if команда == "SEARCH"]
+    assert all("BEFORE" not in args for args in поиски)
+
+
+def test_глубина_архива_запоминается(архив):
+    база, _, _ = архив
+    отметки = [r["covered_since"] for r in строки_базы(база, "SELECT covered_since FROM mailboxes")]
+    assert all(о for о in отметки), "без отметки о глубине углубление не сработает"
+
+
+def test_база_прежней_версии_дотягивается(архив):
+    """Архив клиента не пересобирается при обновлении — колонка добавляется на месте."""
+    база, запустить, _ = архив
+    import sqlite3 as s
+    d = s.connect(str(база))
+    d.execute("CREATE TABLE старое AS SELECT * FROM mailboxes")
+    d.execute("DROP TABLE mailboxes")
+    d.execute("""CREATE TABLE mailboxes (id INTEGER PRIMARY KEY, account TEXT NOT NULL,
+                 folder TEXT NOT NULL, label TEXT NOT NULL, direction TEXT NOT NULL,
+                 uidvalidity INTEGER, last_uid INTEGER NOT NULL DEFAULT 0, synced_at TEXT,
+                 UNIQUE (account, folder))""")
+    d.execute("""INSERT INTO mailboxes (id, account, folder, label, direction, uidvalidity,
+                 last_uid, synced_at) SELECT id, account, folder, label, direction,
+                 uidvalidity, last_uid, synced_at FROM старое""")
+    d.commit()
+    d.close()
+
+    запустить("статистика")
+
+    отметки = [r["covered_since"] for r in строки_базы(база, "SELECT covered_since FROM mailboxes")]
+    assert any(отметки), "глубина должна восстановиться по дате самого старого письма"
 
 
 def test_заново_обновляет_текст_писем(архив, monkeypatch, capsys):

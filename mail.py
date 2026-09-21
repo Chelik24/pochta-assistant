@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS mailboxes (
     direction   TEXT NOT NULL,
     uidvalidity INTEGER,
     last_uid    INTEGER NOT NULL DEFAULT 0,
+    covered_since TEXT,
     synced_at   TEXT,
     UNIQUE (account, folder)
 );
@@ -144,6 +145,7 @@ def открыть_базу(path: Path) -> sqlite3.Connection:
     for токенизатор in ("unicode61 remove_diacritics 2", "unicode61"):
         try:
             db.executescript(СХЕМА.format(токенизатор=токенизатор))
+            доработать_схему(db)
             return db
         except sqlite3.OperationalError as e:
             последняя = e
@@ -151,6 +153,27 @@ def открыть_базу(path: Path) -> sqlite3.Connection:
         "SQLite на этом компьютере собран без полнотекстового поиска (FTS5). "
         f"Нужен Python с python.org. Ошибка: {последняя}"
     )
+
+
+def доработать_схему(db) -> None:
+    """
+    Дотягивает базу, собранную прежней версией, до текущей схемы.
+
+    Архив живёт на машине клиента и пересобирать его при каждом обновлении
+    нельзя: это часы скачивания заново.
+    """
+    столбцы = {строка[1] for строка in db.execute("PRAGMA table_info(mailboxes)")}
+    if "covered_since" not in столбцы:
+        db.execute("ALTER TABLE mailboxes ADD COLUMN covered_since TEXT")
+        # За какой период собрана старая база, мы не записывали. Ближайшая
+        # честная оценка — дата самого старого письма в папке.
+        db.execute(
+            """UPDATE mailboxes SET covered_since =
+                 (SELECT date(MIN(m.ts), 'unixepoch') FROM messages m
+                  WHERE m.mailbox_id = mailboxes.id)
+               WHERE covered_since IS NULL"""
+        )
+        db.commit()
 
 
 def найти_ящик(db, account: str, folder: str, label: str, direction: str) -> sqlite3.Row:
@@ -161,6 +184,25 @@ def найти_ящик(db, account: str, folder: str, label: str, direction: st
     return db.execute(
         "SELECT * FROM mailboxes WHERE account = ? AND folder = ?", (account, folder)
     ).fetchone()
+
+
+def собрано_с(ящик) -> datetime:
+    """С какой даты архив по этой папке уже собран. Нет отметки — значит ни с какой."""
+    значение = ящик["covered_since"] if "covered_since" in ящик.keys() else None
+    if not значение:
+        return None
+    try:
+        return datetime.strptime(значение, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def отметить_ящик(db, mailbox_id: int, последний_uid: int, покрытие: datetime) -> None:
+    db.execute(
+        "UPDATE mailboxes SET last_uid = ?, covered_since = ?, synced_at = ? WHERE id = ?",
+        (последний_uid, покрытие.strftime("%Y-%m-%d"),
+         datetime.now().isoformat(timespec="seconds"), mailbox_id),
+    )
 
 
 def сбросить_ящик(db, mailbox_id: int) -> None:
@@ -336,21 +378,35 @@ def скачать_папку(imap, db, account: str, папка: tuple, args, �
         db.execute("UPDATE mailboxes SET uidvalidity = ? WHERE id = ?", (текущая, ящик["id"]))
 
     последний = 0 if args.заново else ящик["last_uid"]
-    if последний:
-        status, данные = imap.uid("SEARCH", None, "UID", f"{последний + 1}:*")
-    else:
-        status, данные = imap.uid("SEARCH", None, "SINCE", imap_date(since))
-    if status != "OK":
-        итог["ошибка"] = f"сервер не принял поиск в папке {ярлык}"
-        return итог
+    покрыто = собрано_с(ящик) if not args.заново else None
 
-    uids = [int(x) for x in (данные[0].split() if данные and данные[0] else [])]
-    # Диапазон «N:*» сервер отдаёт даже когда новых писем нет — возвращает
-    # последнее имеющееся. Поэтому всё, что не больше последнего, отбрасываем.
-    uids = sorted(u for u in uids if u > последний)
+    # Обычно спрашиваем только то, что новее скачанного. Но если попросили
+    # период глубже уже собранного — надо отдельно сходить и за старым:
+    # у старых писем номера меньше, и в запрос «новее последнего» они не попадут.
+    наборы = [("новые", ["UID", f"{последний + 1}:*"] if последний
+                        else ["SINCE", imap_date(since)])]
+    if покрыто and since.date() < покрыто.date():
+        наборы.append(("старые", ["SINCE", imap_date(since), "BEFORE", imap_date(покрыто)]))
+        print(f"  {ярлык}: архив собран с {покрыто:%d.%m.%Y}, добираю письма старее")
+
+    uids = set()
+    for вид, условия in наборы:
+        status, данные = imap.uid("SEARCH", None, *условия)
+        if status != "OK":
+            итог["ошибка"] = f"сервер не принял поиск в папке {ярлык}"
+            return итог
+        найдены = [int(x) for x in (данные[0].split() if данные and данные[0] else [])]
+        # Диапазон «N:*» сервер отдаёт даже когда новых писем нет — возвращает
+        # последнее имеющееся. Поэтому всё, что не больше последнего, отбрасываем.
+        if вид == "новые" and последний:
+            найдены = [u for u in найдены if u > последний]
+        uids.update(найдены)
+
+    uids = sorted(uids)
+    новое_покрытие = min(since, покрыто) if покрыто else since
+
     if not uids:
-        db.execute("UPDATE mailboxes SET synced_at = ? WHERE id = ?",
-                   (datetime.now().isoformat(timespec="seconds"), ящик["id"]))
+        отметить_ящик(db, ящик["id"], последний, новое_покрытие)
         return итог
 
     if len(uids) > 100:
@@ -390,6 +446,12 @@ def скачать_папку(imap, db, account: str, папка: tuple, args, �
         db.commit()
         if len(uids) > 100:
             print(f"  {ярлык}: {min(начало + ПАРТИЯ, len(uids))} из {len(uids)}")
+
+    # Глубину отмечаем только когда всё скачалось: оборвались на середине —
+    # значит период ещё не собран, и в следующий раз надо повторить.
+    if not итог["ошибка"]:
+        отметить_ящик(db, ящик["id"], максимум, новое_покрытие)
+        db.commit()
 
     return итог
 
@@ -746,13 +808,16 @@ def команда_статистика(args, база_проекта: Path) -> 
     print(f"Архив: писем {всего}, {охват(db)}, {размер:.1f} МБ.")
     for r in db.execute(
         """SELECT b.account, b.label, COUNT(m.id) AS сколько, b.synced_at,
-                  SUM(m.unread) AS непрочитанных
+                  b.covered_since, SUM(m.unread) AS непрочитанных
            FROM mailboxes b LEFT JOIN messages m ON m.mailbox_id = b.id
            GROUP BY b.id ORDER BY b.account, b.label"""
     ):
         докачка = r["synced_at"][:16].replace("T", " ") if r["synced_at"] else "не было"
         непрочитано = f", непрочитанных {r['непрочитанных']}" if r["непрочитанных"] else ""
-        print(f"  {r['account']} — {r['label']}: {r['сколько']}{непрочитано}, докачка {докачка}")
+        собран = собрано_с(r)
+        глубина = f", собран с {собран:%d.%m.%Y}" if собран else ""
+        print(f"  {r['account']} — {r['label']}: {r['сколько']}{непрочитано}"
+              f"{глубина}, докачка {докачка}")
     if not всего:
         print("Пока пусто. Заполнить: `mail.py скачать --дней 30`.")
     db.close()
