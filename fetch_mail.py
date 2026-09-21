@@ -69,6 +69,10 @@ MAX_NAME_LEN = 120
 # Короче этого plain-часть считаем заглушкой вида «письмо содержит HTML»
 PLAIN_STUB_LEN = 30
 
+# Символы нулевой ширины и мягкий перенос: в письме их не видно, но из них
+# состоят «распорки» в рассылках, и в тексте они остаются мусором.
+НЕВИДИМЫЕ = re.compile("[​-‏⁠⁡⁢⁣﻿­]")
+
 # Служебные «вложения», которые на самом деле вложениями не являются:
 # криптоподписи писем. Корпоративная почта цепляет их почти к каждому письму.
 SKIP_TYPES = {
@@ -194,14 +198,26 @@ def is_junk(sender: str, subject: str, rules: list) -> bool:
 # --- разбор письма --------------------------------------------------------
 
 
+def почистить_пустоту(text: str) -> str:
+    """
+    Убирает из текста то, что ничего не значит, но занимает место.
+
+    Рассылки раздвигают вёрстку невидимыми символами и неразрывными пробелами —
+    их бывает по тысяче подряд. На экране их не видно, а в тексте письма они
+    остаются и стоят агенту тех же денег, что и настоящие слова.
+    """
+    text = НЕВИДИМЫЕ.sub("", text)
+    text = text.replace("\xa0", " ")  # &nbsp; иначе не схлопнется с пробелами
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+
 def html_to_text(text: str) -> str:
     text = re.sub(r"(?is)<(script|style).*?</\1>", "", text)
     text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>", "\n", text)
     text = re.sub(r"<[^>]+>", "", text)
-    text = html.unescape(text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n\s*\n+", "\n\n", text)
-    return text.strip()
+    return почистить_пустоту(html.unescape(text))
 
 
 def part_text(part) -> str:
@@ -215,8 +231,9 @@ def part_text(part) -> str:
         charset = part.get_content_charset() or "utf-8"
         content = payload.decode(charset, errors="replace")
     if part.get_content_type() == "text/html":
-        content = html_to_text(content)
-    return content.strip()
+        return html_to_text(content)
+    # Распорки бывают и в обычном тексте: рассылки кладут их в обе части письма
+    return почистить_пустоту(content)
 
 
 def get_text(msg) -> str:

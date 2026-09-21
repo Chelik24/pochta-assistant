@@ -77,6 +77,24 @@ def test_html_превращается_в_текст():
     assert "&nbsp;" not in text and "&mdash;" not in text  # мнемоники раскрыты
 
 
+def test_невидимые_распорки_из_рассылок_вычищаются():
+    """Рассылки раздвигают вёрстку символами нулевой ширины — их бывают тысячи."""
+    msg = EmailMessage()
+    msg["Subject"] = "Аккаунт пополнен"
+    msg["From"] = "info@example.ru"
+    msg.set_content(
+        "<p>Деньги уже на балансе</p><p>" + "&zwnj;&nbsp;" * 500 + "</p>"
+        "<p>Баланс: 96&nbsp;руб.</p>",
+        subtype="html",
+    )
+    text = fetch_mail.get_text(roundtrip(msg))
+
+    assert "Деньги уже на балансе" in text
+    assert "Баланс: 96 руб." in text
+    assert "‌" not in text and "\xa0" not in text
+    assert len(text) < 200, "тысяча распорок не должна попасть в текст письма"
+
+
 def test_если_есть_и_plain_и_html_берётся_plain():
     """Обычное письмо: plain-часть осмысленная — её и читаем, HTML не трогаем."""
     msg = EmailMessage()

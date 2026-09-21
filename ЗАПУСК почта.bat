@@ -1,12 +1,13 @@
 @echo off
 rem Only ASCII in this file: cmd.exe cannot read UTF-8 batch files.
-rem All Russian messages are printed by fetch_mail.py.
+rem All Russian messages are printed by mail.py.
+rem No labels and no multi-line blocks on purpose: those are the parts
+rem that break when the file loses its Windows line endings.
 chcp 65001 > nul
 cd /d "%~dp0"
 
-call run.cmd fetch_mail.py --days 3 --open
-if errorlevel 1 (
-    echo.
-    pause
-    exit /b 1
-)
+call "%~dp0run.cmd" mail.py sync
+echo.
+call "%~dp0run.cmd" mail.py summary --days 3
+echo.
+pause
