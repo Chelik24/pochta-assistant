@@ -835,6 +835,11 @@ def добавить_фильтры(p, дней_по_умолчанию=None) ->
     p.add_argument("--от", "--from", dest="sender", help="отправитель: имя, адрес или домен")
     p.add_argument("--тема", "--subject", dest="subject", help="слово в теме")
     p.add_argument("--ящик", "--mailbox", dest="account", help="если ящиков несколько")
+    p.add_argument("--входящие", "--inbox", dest="direction",
+                   action="store_const", const="входящие")
+    p.add_argument("--отправленные", "--sent", dest="direction",
+                   action="store_const", const="отправленные",
+                   help="только то, что писал он сам")
 
 
 def собрать_разбор() -> argparse.ArgumentParser:
@@ -867,10 +872,6 @@ def собрать_разбор() -> argparse.ArgumentParser:
                                 help="одна строка на письмо — для разбора почты")
     добавить_фильтры(сводка, дней_по_умолчанию=3)
     сводка.add_argument("--непрочитанные", "--unread", dest="unread", action="store_true")
-    сводка.add_argument("--входящие", "--inbox", dest="direction",
-                        action="store_const", const="входящие")
-    сводка.add_argument("--отправленные", "--sent", dest="direction",
-                        action="store_const", const="отправленные")
     сводка.add_argument("--сколько", "--limit", dest="limit", type=int, default=ПРЕДЕЛ_СВОДКИ)
     сводка.add_argument("--всё", "--all", dest="всё", action="store_true",
                         help="не отбрасывать мусор по Шаблоны/игнор.txt")
